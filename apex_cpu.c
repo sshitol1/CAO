@@ -174,6 +174,54 @@ print_reg_file(const APEX_CPU *cpu)
     printf("\n");
 }
 
+void initialize_BTB() {
+    for (int i = 0; i < BTB_SIZE; ++i) {
+        btb[i].instruction_address = -1; // Indicates an empty entry
+        btb[i].history_bits = 0; // Initialize based on the branch type
+        btb[i].target_address = -1;
+    }
+}
+
+int is_write_to_reg_instruction(int opcode)
+{
+    switch (opcode)
+    {
+        case OPCODE_ADD:
+        case OPCODE_SUB:
+        case OPCODE_MUL:
+        case OPCODE_AND:
+        case OPCODE_OR:
+        case OPCODE_XOR:
+        case OPCODE_MOVC:
+        case OPCODE_ADDL:
+        case OPCODE_SUBL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int should_take_branch(int history_bits, int branch_type) {
+    // Check branch type and make prediction based on history bits
+    switch (branch_type) {
+        case OPCODE_BNZ: // Fall through
+        case OPCODE_BP:
+            // Predict taken if any of the last two were taken (i.e., if any bit is 1)
+            return (history_bits & 0b01) || (history_bits & 0b10);
+
+        case OPCODE_BZ: // Fall through
+        case OPCODE_BNP:
+            // Predict not taken if any of the last two were not taken (i.e., if any bit is 0)
+            return !((history_bits & 0b01) && (history_bits & 0b10));
+
+        default:
+            // For other types of branches or instructions, handle accordingly
+            // Or return a default prediction
+            return 0; // Or any default value
+    }
+}
+
+
 /*
  * Fetch Stage of APEX Pipeline
  *
@@ -182,7 +230,36 @@ print_reg_file(const APEX_CPU *cpu)
 static void
 APEX_fetch(APEX_CPU *cpu)
 {
+    if (cpu->fetch.stall) {
+        // Skip fetching new instruction
+        // printf("Fetch stage stall flag before fetch: %d\n", cpu->fetch.stall);
+        // printf("Decode stage stall flag before fetch: %d\n", cpu->decode.stall);
+        detect_data_hazards(cpu);
+
+        return;
+    }
     APEX_Instruction *current_ins;
+
+    if (cpu->fetch.opcode == OPCODE_BZ ||
+        cpu->fetch.opcode == OPCODE_BNZ ||
+        cpu->fetch.opcode == OPCODE_BP ||
+        cpu->fetch.opcode == OPCODE_BNP) {
+        int btb_index = find_in_BTB(cpu->fetch.pc);
+
+    if (btb_index != -1) {
+        // Get the opcode (branch type) of the current instruction
+        int branch_type = cpu->fetch.opcode;
+
+        // Check if the branch should be taken based on the history bits and branch type
+        if (should_take_branch(btb[btb_index].history_bits, branch_type)) {
+            // Branch is predicted to be taken
+            cpu->pc = btb[btb_index].target_address;
+        } else {
+            // Branch is predicted not to be taken
+            cpu->pc += 4; // Move to the next instruction
+        }
+    }
+        }
 
     if (cpu->fetch.has_insn)
     {
@@ -241,8 +318,34 @@ APEX_fetch(APEX_CPU *cpu)
 static void
 APEX_decode(APEX_CPU *cpu)
 {
+    if (cpu->decode.stall) {
+        // Skip fetching new instruction
+        return;
+    }
     if (cpu->decode.has_insn)
     {
+        if (is_write_to_reg_instruction(cpu->execute.opcode) && 
+            (cpu->decode.rs1 == cpu->execute.rd || cpu->decode.rs2 == cpu->execute.rd)) {
+            // Forward data from Execute stage
+            if (cpu->decode.rs1 == cpu->execute.rd) {
+                cpu->decode.rs1_value = cpu->execute.result_buffer;
+            }
+            if (cpu->decode.rs2 == cpu->execute.rd) {
+                cpu->decode.rs2_value = cpu->execute.result_buffer;
+            }
+        }
+
+        /* Check for data forwarding from Memory stage */
+        if (is_write_to_reg_instruction(cpu->memory.opcode) && 
+            (cpu->decode.rs1 == cpu->memory.rd || cpu->decode.rs2 == cpu->memory.rd)) {
+            // Forward data from Memory stage
+            if (cpu->decode.rs1 == cpu->memory.rd) {
+                cpu->decode.rs1_value = cpu->memory.result_buffer;
+            }
+            if (cpu->decode.rs2 == cpu->memory.rd) {
+                cpu->decode.rs2_value = cpu->memory.result_buffer;
+            }
+        }
         /* Read operands from register file based on the instruction type */
         switch (cpu->decode.opcode)
         {
@@ -363,6 +466,10 @@ APEX_decode(APEX_CPU *cpu)
 static void
 APEX_execute(APEX_CPU *cpu)
 {
+    if (cpu->execute.stall) {
+        // Skip fetching new instruction
+        return;
+    }
     if (cpu->execute.has_insn)
     {
         /* Execute logic based on instruction type */
@@ -739,6 +846,10 @@ APEX_execute(APEX_CPU *cpu)
 static void
 APEX_memory(APEX_CPU *cpu)
 {
+    if (cpu->memory.stall) {
+        // Skip fetching new instruction
+        return;
+    }
     if (cpu->memory.has_insn)
     {
         switch (cpu->memory.opcode)
@@ -803,6 +914,10 @@ APEX_memory(APEX_CPU *cpu)
 static int
 APEX_writeback(APEX_CPU *cpu)
 {
+    if (cpu->writeback.stall) {
+        // Skip fetching new instruction
+        return FALSE;
+    }
     if (cpu->writeback.has_insn)
     {
         /* Write result to register file based on instruction type */
@@ -908,6 +1023,14 @@ APEX_cpu_init(const char *filename)
         return NULL;
     }
 
+    cpu->fetch.stall = 0;
+    cpu->decode.stall = 0;
+    cpu->execute.stall = 0;
+    cpu->memory.stall = 0;
+    cpu->writeback.stall = 0;
+
+    printf("Fetch stage stall flag before fetch: %d\n", cpu->fetch.stall);
+
     /* Initialize PC, Registers and all pipeline stages */
     cpu->pc = 4000;
     memset(cpu->regs, 0, sizeof(int) * REG_FILE_SIZE);
@@ -945,6 +1068,51 @@ APEX_cpu_init(const char *filename)
     return cpu;
 }
 
+
+
+void detect_data_hazards(APEX_CPU *cpu) {
+    // Check if both stages have valid instructions
+    if (cpu->execute.has_insn && cpu->decode.has_insn) {
+
+        // Check if the execute stage instruction writes to a register
+        if (cpu->execute.opcode == OPCODE_ADD  ||
+            cpu->execute.opcode == OPCODE_SUB  ||
+            cpu->execute.opcode == OPCODE_MUL  ||
+            cpu->execute.opcode == OPCODE_AND  ||
+            cpu->execute.opcode == OPCODE_OR   ||
+            cpu->execute.opcode == OPCODE_XOR  ||
+            cpu->execute.opcode == OPCODE_MOVC ||
+            cpu->execute.opcode == OPCODE_ADDL ||
+            cpu->execute.opcode == OPCODE_SUBL ) 
+        {
+            int execute_dest_reg = cpu->execute.rd;
+            printf("rs1 %d\n", cpu->decode.rs1);
+            printf("rs2 %d\n", cpu->decode.rs2);
+            printf("rd %d\n", cpu->decode.rd);
+
+            // Check if the execute stage instruction's destination register is non-zero
+            // and if the decode stage instruction uses the same register as a source
+            if (execute_dest_reg != 0 &&
+                (cpu->decode.rs1 == execute_dest_reg || cpu->decode.rs2 == execute_dest_reg)) {
+                // RAW hazard detected, stall the pipeline
+                cpu->decode.stall = 1;
+                cpu->fetch.stall = 1;
+            } else {
+                // No hazard, clear stall flags
+                cpu->decode.stall = 0;
+                cpu->fetch.stall = 0;
+                APEX_fetch(cpu);
+            }
+        } else {
+            // No hazard, clear stall flags
+            cpu->decode.stall = 0;
+            cpu->fetch.stall = 0;
+        }
+    }
+}
+
+
+
 /*
  * APEX CPU simulation loop
  *
@@ -957,6 +1125,9 @@ APEX_cpu_run(APEX_CPU *cpu)
 
     while (TRUE)
     {
+
+
+       
         if (ENABLE_DEBUG_MESSAGES)
         {
             printf("--------------------------------------------\n");
@@ -971,10 +1142,44 @@ APEX_cpu_run(APEX_CPU *cpu)
             break;
         }
 
+        // APEX_memory(cpu);
+        // APEX_execute(cpu);
+        // APEX_decode(cpu);
+        // APEX_fetch(cpu);
+
+        if (!cpu->memory.stall) {
         APEX_memory(cpu);
-        APEX_execute(cpu);
-        APEX_decode(cpu);
-        APEX_fetch(cpu);
+        }else {
+            // Check if the stall condition is resolved
+            detect_data_hazards(cpu);
+        }
+
+        // Execute Stage
+        if (!cpu->execute.stall) {
+            APEX_execute(cpu);
+        }else {
+            // Check if the stall condition is resolved
+            detect_data_hazards(cpu);
+        }
+
+        // Decode Stage
+        if (!cpu->decode.stall) {
+            APEX_decode(cpu);
+        } else {
+            // Check if the stall condition is resolved
+            detect_data_hazards(cpu);
+        }
+
+        // Fetch Stage
+        if (!cpu->fetch.stall) {
+            APEX_fetch(cpu);
+        }else {
+            // Check if the stall condition is resolved
+            detect_data_hazards(cpu);
+        }
+
+        // Detect hazards before running the stages
+        detect_data_hazards(cpu);
 
         print_reg_file(cpu);
 

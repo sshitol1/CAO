@@ -45,6 +45,9 @@
 #define OPCODE_BN 0x17         // opcode for BN
 #define OPCODE_BNN 0x18        // opcode for BNN
 #define OPCODE_NOP 0x19        // opcode for NOP
+#define BTB_SIZE 4
+BTB_Entry btb[BTB_SIZE];
+
 /* Set this flag to 1 to enable debug messages */
 #define ENABLE_DEBUG_MESSAGES 1
 
